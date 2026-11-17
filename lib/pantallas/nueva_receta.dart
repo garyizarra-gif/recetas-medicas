@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
@@ -7,10 +5,11 @@ import '../datos/base_datos.dart';
 import '../formato.dart';
 import '../servicios/avisos.dart';
 import '../servicios/fotos.dart';
-import 'recetas.dart' show PantallaFoto;
+import 'recetas.dart' show TiraAdjuntos;
 
 /// Datos de un medicamento mientras se llena el formulario.
 class _FormMedicamento {
+  int? id; // solo si el medicamento ya estaba guardado (edición)
   final nombre = TextEditingController();
   final dosis = TextEditingController();
   final via = TextEditingController(text: 'Oral');
@@ -24,6 +23,19 @@ class _FormMedicamento {
     return DateTime(n.year, n.month, n.day, n.hour);
   }
 
+  _FormMedicamento();
+
+  _FormMedicamento.desde(Medicamento m) {
+    id = m.id;
+    nombre.text = m.nombre;
+    dosis.text = m.dosis;
+    via.text = m.via;
+    cadaHoras.text = m.cadaHoras?.toString() ?? '';
+    dias.text = m.dias?.toString() ?? '';
+    nota.text = m.nota;
+    if (m.primeraToma != null) primeraToma = m.primeraToma!;
+  }
+
   void liberar() {
     for (final c in [nombre, dosis, via, cadaHoras, dias, nota]) {
       c.dispose();
@@ -32,7 +44,9 @@ class _FormMedicamento {
 }
 
 class PantallaNuevaReceta extends StatefulWidget {
-  const PantallaNuevaReceta({super.key});
+  /// Si se indica, la pantalla edita esa receta en vez de crear una nueva.
+  final Receta? receta;
+  const PantallaNuevaReceta({super.key, this.receta});
 
   @override
   State<PantallaNuevaReceta> createState() => _EstadoNuevaReceta();
@@ -43,32 +57,64 @@ class _EstadoNuevaReceta extends State<PantallaNuevaReceta> {
   final _clinica = TextEditingController();
   final _diagnostico = TextEditingController();
   DateTime _fecha = DateTime.now();
-  final List<_FormMedicamento> _meds = [_FormMedicamento()];
-  String? _foto;
+  late final List<_FormMedicamento> _meds;
+  final List<String> _adjuntos = [];
+  // Adjuntos que ya estaban guardados: no se borran hasta confirmar el cambio.
+  final Set<String> _originales = {};
   bool _guardada = false;
 
-  Future<void> _tomarFoto(ImageSource fuente) async {
+  bool get _editando => widget.receta != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final r = widget.receta;
+    if (r == null) {
+      _meds = [_FormMedicamento()];
+      return;
+    }
+    _clinica.text = r.clinica;
+    _diagnostico.text = r.diagnostico;
+    _fecha = r.fecha;
+    _adjuntos.addAll(r.adjuntos);
+    _originales.addAll(r.adjuntos);
+    _meds = r.medicamentos.map(_FormMedicamento.desde).toList();
+    if (_meds.isEmpty) _meds.add(_FormMedicamento());
+  }
+
+  Future<void> _agregarAdjuntos(Future<List<String>> Function() obtener) async {
     try {
-      final ruta = await Fotos.capturar(fuente);
-      if (ruta == null || !mounted) return;
-      await Fotos.borrar(_foto);
-      setState(() => _foto = ruta);
+      final rutas = await obtener();
+      if (!mounted) {
+        await Fotos.borrarVarias(rutas);
+        return;
+      }
+      if (rutas.isNotEmpty) setState(() => _adjuntos.addAll(rutas));
     } catch (_) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('No se pudo abrir la cámara o la galería. Revisa los permisos.')));
+          content: Text(
+              'No se pudo abrir la cámara, la galería o los archivos. Revisa los permisos.')));
     }
   }
 
-  Future<void> _quitarFoto() async {
-    await Fotos.borrar(_foto);
-    if (mounted) setState(() => _foto = null);
+  Future<List<String>> _camara() async {
+    final r = await Fotos.capturar(ImageSource.camera);
+    return r == null ? [] : [r];
+  }
+
+  Future<void> _quitarAdjunto(String ruta) async {
+    setState(() => _adjuntos.remove(ruta));
+    // Los ya guardados se borran recién al confirmar la edición.
+    if (!_originales.contains(ruta)) await Fotos.borrar(ruta);
   }
 
   @override
   void dispose() {
-    // Si el usuario sale sin guardar, no dejamos la foto huérfana.
-    if (!_guardada) Fotos.borrar(_foto);
+    // Si el usuario sale sin guardar, no dejamos archivos nuevos huérfanos.
+    if (!_guardada) {
+      Fotos.borrarVarias(_adjuntos.where((r) => !_originales.contains(r)));
+    }
     _clinica.dispose();
     _diagnostico.dispose();
     for (final m in _meds) {
@@ -88,10 +134,12 @@ class _EstadoNuevaReceta extends State<PantallaNuevaReceta> {
   }
 
   Future<void> _elegirPrimeraToma(_FormMedicamento m) async {
+    final ayer = DateTime.now().subtract(const Duration(days: 1));
     final f = await showDatePicker(
       context: context,
       initialDate: m.primeraToma,
-      firstDate: DateTime.now().subtract(const Duration(days: 1)),
+      // Al editar, la primera toma guardada puede ser anterior a ayer.
+      firstDate: m.primeraToma.isBefore(ayer) ? m.primeraToma : ayer,
       lastDate: DateTime.now().add(const Duration(days: 365)),
     );
     if (f == null || !mounted) return;
@@ -117,6 +165,7 @@ class _EstadoNuevaReceta extends State<PantallaNuevaReceta> {
       final dias = int.tryParse(f.dias.text.trim());
       final conHorario = cada != null && dias != null;
       meds.add(Medicamento(
+        id: f.id,
         nombre: f.nombre.text.trim(),
         dosis: f.dosis.text.trim(),
         via: f.via.text.trim().isEmpty ? 'Oral' : f.via.text.trim(),
@@ -127,10 +176,11 @@ class _EstadoNuevaReceta extends State<PantallaNuevaReceta> {
       ));
     }
     final receta = Receta(
+      id: widget.receta?.id,
       fecha: _fecha,
       clinica: _clinica.text.trim(),
       diagnostico: _diagnostico.text.trim(),
-      foto: _foto,
+      adjuntos: List.of(_adjuntos),
       medicamentos: meds,
     );
     Navigator.of(context).push<bool>(MaterialPageRoute(
@@ -138,7 +188,7 @@ class _EstadoNuevaReceta extends State<PantallaNuevaReceta> {
     )).then((guardada) {
       if (guardada == true) {
         _guardada = true;
-        if (mounted) Navigator.of(context).pop();
+        if (mounted) Navigator.of(context).pop(true);
       }
     });
   }
@@ -146,7 +196,7 @@ class _EstadoNuevaReceta extends State<PantallaNuevaReceta> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Nueva receta')),
+      appBar: AppBar(title: Text(_editando ? 'Editar receta' : 'Nueva receta')),
       body: Form(
         key: _formKey,
         child: ListView(
@@ -205,43 +255,35 @@ class _EstadoNuevaReceta extends State<PantallaNuevaReceta> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Foto de la receta (opcional)',
+            Text('Fotos o PDF de la receta (opcional)',
                 style: Theme.of(context).textTheme.titleSmall),
             const SizedBox(height: 4),
             const Text(
-                'Guárdala para no perderla. Luego completa los datos de abajo mirando la foto.'),
+                'Puedes agregar varias fotos del mismo caso (receta, reverso, otra hoja) y archivos PDF. '
+                'Luego completa los datos de abajo mirándolos.'),
             const SizedBox(height: 8),
-            if (_foto != null) ...[
-              GestureDetector(
-                onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                    builder: (_) => PantallaFoto(ruta: _foto!))),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.file(File(_foto!),
-                      height: 180, width: double.infinity, fit: BoxFit.cover),
-                ),
-              ),
+            if (_adjuntos.isNotEmpty) ...[
+              TiraAdjuntos(rutas: _adjuntos, onQuitar: _quitarAdjunto),
               const SizedBox(height: 8),
             ],
             Wrap(
               spacing: 8,
               children: [
                 FilledButton.icon(
-                  onPressed: () => _tomarFoto(ImageSource.camera),
+                  onPressed: () => _agregarAdjuntos(_camara),
                   icon: const Icon(Icons.photo_camera),
-                  label: Text(_foto == null ? 'Tomar foto' : 'Tomar otra'),
+                  label: Text(_adjuntos.isEmpty ? 'Tomar foto' : 'Otra foto'),
                 ),
                 OutlinedButton.icon(
-                  onPressed: () => _tomarFoto(ImageSource.gallery),
+                  onPressed: () => _agregarAdjuntos(Fotos.galeriaVarias),
                   icon: const Icon(Icons.photo_library_outlined),
                   label: const Text('Galería'),
                 ),
-                if (_foto != null)
-                  TextButton.icon(
-                    onPressed: _quitarFoto,
-                    icon: const Icon(Icons.delete_outline),
-                    label: const Text('Quitar'),
-                  ),
+                OutlinedButton.icon(
+                  onPressed: () => _agregarAdjuntos(Fotos.elegirPdfs),
+                  icon: const Icon(Icons.picture_as_pdf_outlined),
+                  label: const Text('PDF'),
+                ),
               ],
             ),
           ],
@@ -367,14 +409,22 @@ class _EstadoConfirmar extends State<PantallaConfirmar> {
 
   Future<void> _confirmar() async {
     setState(() => _guardando = true);
-    final avisos = await baseDatos.guardarReceta(widget.receta);
+    final editando = widget.receta.id != null;
+    final List<AvisoPendiente> avisos;
+    if (editando) {
+      final r = await baseDatos.actualizarReceta(widget.receta, DateTime.now());
+      await Avisos.cancelarVarios(r.cancelar);
+      avisos = r.programar;
+    } else {
+      avisos = await baseDatos.guardarReceta(widget.receta);
+    }
     await Avisos.pedirPermisos();
     await Avisos.programarTodos(avisos);
     if (!mounted) return;
+    final base = editando ? 'Receta actualizada.' : 'Receta guardada.';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(avisos.isEmpty
-          ? 'Receta guardada.'
-          : 'Receta guardada. ${avisos.length} avisos programados.'),
+      content: Text(
+          avisos.isEmpty ? base : '$base ${avisos.length} avisos programados.'),
     ));
     Navigator.of(context).pop(true);
   }
@@ -395,12 +445,8 @@ class _EstadoConfirmar extends State<PantallaConfirmar> {
           Text('${fechaCorta(r.fecha)}'
               '${r.clinica.isEmpty ? '' : ' · ${r.clinica}'}'),
           const SizedBox(height: 12),
-          if (r.foto != null && Fotos.existe(r.foto)) ...[
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Image.file(File(r.foto!),
-                  height: 140, width: double.infinity, fit: BoxFit.cover),
-            ),
+          if (r.adjuntos.isNotEmpty) ...[
+            TiraAdjuntos(rutas: r.adjuntos),
             const SizedBox(height: 12),
           ],
           for (final m in r.medicamentos)
@@ -431,8 +477,13 @@ class _EstadoConfirmar extends State<PantallaConfirmar> {
               ),
             ),
           const SizedBox(height: 8),
-          Text('Se programarán $total avisos.',
-              style: Theme.of(context).textTheme.titleSmall),
+          if (r.id != null)
+            const Text(
+                'Los medicamentos sin cambios siguen igual. Si cambiaste el horario de uno, '
+                'sus tomas anteriores se reemplazan por las nuevas.')
+          else
+            Text('Se programarán $total avisos.',
+                style: Theme.of(context).textTheme.titleSmall),
           const SizedBox(height: 16),
           FilledButton(
             onPressed: _guardando ? null : _confirmar,

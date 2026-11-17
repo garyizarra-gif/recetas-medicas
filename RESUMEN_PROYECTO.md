@@ -71,7 +71,20 @@ Primera versión solo Android. Respaldo y cambio de celular vía Google Drive de
 - Configuración Android: `compileSdk = 37` y `android.suppressUnsupportedCompileSdk=37` (las dependencias lo exigen); desugaring activado. Plataformas Android 36 y 37.0 instaladas.
 - Notas: `C:\src\flutter\bin` no está en el PATH de Windows. Sin tono propio todavía (usa el sonido por defecto con importancia máxima y vibración larga). No hay pruebas de pantallas ni de base de datos.
 
+## 10a. Adjuntos múltiples y edición de recetas (16-nov-2026)
+- Una receta admite varias fotos y PDF (tabla `adjuntos`, base de datos versión 4; la foto anterior migra como primer adjunto). Paquetes nuevos: `file_picker` (elegir PDF) y `open_filex` (abrir PDF con el lector del celular). Visor de fotos con deslizamiento (`PantallaFotos`).
+- Editar receta (lápiz en el detalle): cambia datos, adjuntos y medicamentos. Sin cambios = no se toca; cambio de texto = se conservan tomas y se reprograman avisos; cambio de horario = se reemplazan las tomas de ese medicamento; quitado = se borra con sus tomas.
+- Idea registrada: adjuntar el resumen de la consulta (PDF exportado de NotebookLM). NotebookLM no tiene API abierta para vincularlo; opciones futuras: botón "Compartir" / recibir PDF desde Compartir, etiqueta "Resumen de la consulta", adjuntar audio, o grabar con la API de Gemini en la Etapa 3 (requiere consentimiento y revisar privacidad).
+- No probado en un aparato; la compilación del APK con los paquetes nuevos aún no se confirmó.
+
+## 10b. Publicación (11-nov-2026)
+- Código publicado en https://github.com/garyizarra-gif/recetas-medicas (público, rama `main`, 1 commit). Sin PDF, APK ni claves en el repositorio.
+- APK de depuración (187 MB) para pruebas en Google Drive: Mi unidad > Recetas Medicas APK > RecetasMedicas-prueba.apk.
+- **Pendiente:** compilar el APK de lanzamiento (`flutter build apk --release`, se lanzó pero no se confirmó que terminara) y subirlo como Release `v0.1-prueba` en GitHub. Hay un cambio sin commit en `android/app/build.gradle.kts` (minimización desactivada en release).
+- Sesión de `gh` iniciada con la cuenta garyizarra-gif.
+
 ## 11. Siguiente acción
+0. Terminar el APK de lanzamiento y la Release en GitHub (ver 10b).
 1. **Probar en un celular Android real:** activar opciones de desarrollador y depuración USB, conectarlo, y ejecutar `flutter run`; o instalar el APK. Verificar: aviso de prueba con la app cerrada y pantalla bloqueada, receta de ejemplo, reinicio del celular, "Tomado", paso a "no registrada".
 2. Corregir lo que falle en esa prueba (especialmente avisos en celulares con ahorro de batería agresivo).
 3. Decidir tono propio para los avisos y generar un APK de lanzamiento firmado cuando esté validado.

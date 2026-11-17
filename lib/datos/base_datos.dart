@@ -51,7 +51,7 @@ class Receta {
   DateTime fecha;
   String clinica;
   String diagnostico;
-  String? foto; // ruta de la foto de la receta, si la hay
+  List<String> adjuntos; // rutas de fotos y PDF de la receta
   List<Medicamento> medicamentos;
 
   Receta({
@@ -59,9 +59,18 @@ class Receta {
     required this.fecha,
     this.clinica = '',
     required this.diagnostico,
-    this.foto,
+    List<String>? adjuntos,
     List<Medicamento>? medicamentos,
-  }) : medicamentos = medicamentos ?? [];
+  })  : adjuntos = adjuntos ?? [],
+        medicamentos = medicamentos ?? [];
+
+  /// Primera foto (no PDF) que exista, para la miniatura.
+  String? get portada {
+    for (final a in adjuntos) {
+      if (!Fotos.esPdf(a) && Fotos.existe(a)) return a;
+    }
+    return null;
+  }
 
   bool activa(DateTime ahora) => medicamentos.any((m) =>
       m.tieneHorario &&
@@ -142,13 +151,19 @@ class BaseDatos {
     final ruta = p.join(await getDatabasesPath(), 'recetas.db');
     final db = await openDatabase(
       ruta,
-      version: 3,
+      version: 4,
       onConfigure: (d) async => d.execute('PRAGMA foreign_keys = ON'),
       onUpgrade: (d, antes, despues) async {
         if (antes < 2) {
           await d.execute('ALTER TABLE recetas ADD COLUMN foto TEXT');
         }
         if (antes < 3) await _crearTablaExamenes(d);
+        if (antes < 4) {
+          await _crearTablaAdjuntos(d);
+          // La foto única de las recetas pasa a ser el primer adjunto.
+          await d.execute('INSERT INTO adjuntos(receta_id, ruta, orden) '
+              'SELECT id, foto, 0 FROM recetas WHERE foto IS NOT NULL');
+        }
       },
       onCreate: (d, v) async {
         await d.execute('CREATE TABLE recetas('
@@ -168,6 +183,7 @@ class BaseDatos {
         await d.execute(
             'CREATE TABLE ajustes(clave TEXT PRIMARY KEY, valor TEXT NOT NULL)');
         await _crearTablaExamenes(d);
+        await _crearTablaAdjuntos(d);
       },
     );
     final bd = BaseDatos._(db);
@@ -182,6 +198,14 @@ class BaseDatos {
         'valor REAL NOT NULL, unidad TEXT NOT NULL, fecha INTEGER NOT NULL, '
         'ref_min REAL, ref_max REAL, foto TEXT, nota TEXT NOT NULL)');
     await d.execute('CREATE INDEX idx_examenes_fecha ON examenes(fecha)');
+  }
+
+  static Future<void> _crearTablaAdjuntos(DatabaseExecutor d) async {
+    await d.execute('CREATE TABLE adjuntos('
+        'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+        'receta_id INTEGER NOT NULL REFERENCES recetas(id) ON DELETE CASCADE, '
+        'ruta TEXT NOT NULL, orden INTEGER NOT NULL)');
+    await d.execute('CREATE INDEX idx_adjuntos_receta ON adjuntos(receta_id)');
   }
 
   Future<void> guardarExamen(Examen e) async {
@@ -247,29 +271,154 @@ class BaseDatos {
         'fecha': _ms(receta.fecha),
         'clinica': receta.clinica,
         'diagnostico': receta.diagnostico,
-        'foto': receta.foto,
       });
+      await _guardarAdjuntos(tx, recetaId, receta.adjuntos);
       for (final m in receta.medicamentos) {
-        final medId = await tx.insert('medicamentos', {
-          'receta_id': recetaId,
-          'nombre': m.nombre,
-          'dosis': m.dosis,
-          'via': m.via,
-          'cada_horas': m.cadaHoras,
-          'dias': m.dias,
-          'primera_toma': m.primeraToma == null ? null : _ms(m.primeraToma!),
-          'nota': m.nota,
-        });
-        for (final h in m.horas) {
-          final tomaId =
-              await tx.insert('tomas', {'medicamento_id': medId, 'hora': _ms(h)});
-          avisos.add(AvisoPendiente(tomaId, h, m.titulo, m.via));
-        }
+        final medId =
+            await tx.insert('medicamentos', _filaMedicamento(recetaId, m));
+        avisos.addAll(await _crearTomas(tx, medId, m));
       }
     });
     cambios.value++;
     return avisos;
   }
+
+  static Map<String, Object?> _filaMedicamento(int recetaId, Medicamento m) => {
+        'receta_id': recetaId,
+        'nombre': m.nombre,
+        'dosis': m.dosis,
+        'via': m.via,
+        'cada_horas': m.cadaHoras,
+        'dias': m.dias,
+        'primera_toma': m.primeraToma == null ? null : _ms(m.primeraToma!),
+        'nota': m.nota,
+      };
+
+  Future<List<AvisoPendiente>> _crearTomas(
+      DatabaseExecutor tx, int medId, Medicamento m) async {
+    final avisos = <AvisoPendiente>[];
+    for (final h in m.horas) {
+      final tomaId =
+          await tx.insert('tomas', {'medicamento_id': medId, 'hora': _ms(h)});
+      avisos.add(AvisoPendiente(tomaId, h, m.titulo, m.via));
+    }
+    return avisos;
+  }
+
+  Future<void> _guardarAdjuntos(
+      DatabaseExecutor tx, int recetaId, List<String> rutas) async {
+    for (var i = 0; i < rutas.length; i++) {
+      await tx.insert(
+          'adjuntos', {'receta_id': recetaId, 'ruta': rutas[i], 'orden': i});
+    }
+  }
+
+  /// Guarda los cambios de una receta ya existente (datos, adjuntos y
+  /// medicamentos agregados, modificados o quitados).
+  ///
+  /// - Medicamento sin cambios: no se toca (conserva su historial de tomas).
+  /// - Cambió solo nombre, dosis, vía o nota: se conservan las tomas y se
+  ///   reprograman los avisos futuros con el texto nuevo.
+  /// - Cambió el horario: se reemplazan todas sus tomas por las nuevas.
+  /// - Medicamento quitado: se borra con sus tomas.
+  ///
+  /// Devuelve los ids de toma cuyo aviso hay que cancelar y los avisos por programar.
+  Future<({List<int> cancelar, List<AvisoPendiente> programar})>
+      actualizarReceta(Receta receta, DateTime ahora) async {
+    final cancelar = <int>[];
+    final programar = <AvisoPendiente>[];
+    final archivosSobrantes = <String>[];
+    final recetaId = receta.id!;
+
+    await _db.transaction((tx) async {
+      await tx.update(
+          'recetas',
+          {
+            'fecha': _ms(receta.fecha),
+            'clinica': receta.clinica,
+            'diagnostico': receta.diagnostico,
+          },
+          where: 'id = ?',
+          whereArgs: [recetaId]);
+
+      final antes = (await tx
+              .query('adjuntos', where: 'receta_id = ?', whereArgs: [recetaId]))
+          .map((f) => f['ruta'] as String)
+          .toList();
+      await tx.delete('adjuntos', where: 'receta_id = ?', whereArgs: [recetaId]);
+      await _guardarAdjuntos(tx, recetaId, receta.adjuntos);
+      archivosSobrantes.addAll(antes.where((r) => !receta.adjuntos.contains(r)));
+
+      final filas = await tx
+          .query('medicamentos', where: 'receta_id = ?', whereArgs: [recetaId]);
+      final previos = {
+        for (final f in filas) f['id'] as int: _leerMedicamento(f),
+      };
+      final conservados = receta.medicamentos.map((m) => m.id).toSet();
+
+      Future<List<int>> idsTomas(int medId) async => (await tx.query('tomas',
+              columns: ['id'], where: 'medicamento_id = ?', whereArgs: [medId]))
+          .map((f) => f['id'] as int)
+          .toList();
+
+      // Medicamentos quitados.
+      for (final id in previos.keys.where((id) => !conservados.contains(id))) {
+        cancelar.addAll(await idsTomas(id));
+        await tx.delete('medicamentos', where: 'id = ?', whereArgs: [id]);
+      }
+
+      for (final m in receta.medicamentos) {
+        final previo = m.id == null ? null : previos[m.id];
+        if (previo == null) {
+          final medId =
+              await tx.insert('medicamentos', _filaMedicamento(recetaId, m));
+          programar.addAll(await _crearTomas(tx, medId, m));
+          continue;
+        }
+        final mismoHorario = previo.cadaHoras == m.cadaHoras &&
+            previo.dias == m.dias &&
+            previo.primeraToma == m.primeraToma;
+        final mismoTexto = previo.nombre == m.nombre &&
+            previo.dosis == m.dosis &&
+            previo.via == m.via &&
+            previo.nota == m.nota;
+        if (mismoHorario && mismoTexto) continue;
+
+        await tx.update('medicamentos', _filaMedicamento(recetaId, m),
+            where: 'id = ?', whereArgs: [m.id]);
+        if (mismoHorario) {
+          final futuras = await tx.query('tomas',
+              where: 'medicamento_id = ? AND hora > ? AND registro IS NULL',
+              whereArgs: [m.id, _ms(ahora)]);
+          for (final t in futuras) {
+            cancelar.add(t['id'] as int);
+            programar.add(AvisoPendiente(
+                t['id'] as int, _fecha(t['hora'] as int), m.titulo, m.via));
+          }
+        } else {
+          cancelar.addAll(await idsTomas(m.id!));
+          await tx.delete('tomas',
+              where: 'medicamento_id = ?', whereArgs: [m.id]);
+          programar.addAll(await _crearTomas(tx, m.id!, m));
+        }
+      }
+    });
+    await Fotos.borrarVarias(archivosSobrantes);
+    cambios.value++;
+    return (cancelar: cancelar, programar: programar);
+  }
+
+  static Medicamento _leerMedicamento(Map<String, Object?> m) => Medicamento(
+        id: m['id'] as int,
+        nombre: m['nombre'] as String,
+        dosis: m['dosis'] as String,
+        via: m['via'] as String,
+        cadaHoras: m['cada_horas'] as int?,
+        dias: m['dias'] as int?,
+        primeraToma:
+            m['primera_toma'] == null ? null : _fecha(m['primera_toma'] as int),
+        nota: m['nota'] as String,
+      );
 
   static const _selectTomas =
       'SELECT t.id, t.hora, t.registro, m.nombre, m.dosis, m.via '
@@ -319,26 +468,15 @@ class BaseDatos {
     for (final f in filas) {
       final meds = await _db.query('medicamentos',
           where: 'receta_id = ?', whereArgs: [f['id']], orderBy: 'id');
+      final adj = await _db.query('adjuntos',
+          where: 'receta_id = ?', whereArgs: [f['id']], orderBy: 'orden, id');
       resultado.add(Receta(
         id: f['id'] as int,
         fecha: _fecha(f['fecha'] as int),
         clinica: f['clinica'] as String,
         diagnostico: f['diagnostico'] as String,
-        foto: f['foto'] as String?,
-        medicamentos: meds
-            .map((m) => Medicamento(
-                  id: m['id'] as int,
-                  nombre: m['nombre'] as String,
-                  dosis: m['dosis'] as String,
-                  via: m['via'] as String,
-                  cadaHoras: m['cada_horas'] as int?,
-                  dias: m['dias'] as int?,
-                  primeraToma: m['primera_toma'] == null
-                      ? null
-                      : _fecha(m['primera_toma'] as int),
-                  nota: m['nota'] as String,
-                ))
-            .toList(),
+        adjuntos: adj.map((a) => a['ruta'] as String).toList(),
+        medicamentos: meds.map(_leerMedicamento).toList(),
       ));
     }
     return resultado;
@@ -353,10 +491,12 @@ class BaseDatos {
     ))
         .map((f) => f['id'] as int)
         .toList();
-    final fotoFila =
-        await _db.query('recetas', columns: ['foto'], where: 'id = ?', whereArgs: [recetaId]);
+    final archivos = (await _db.query('adjuntos',
+            columns: ['ruta'], where: 'receta_id = ?', whereArgs: [recetaId]))
+        .map((f) => f['ruta'] as String)
+        .toList();
     await _db.delete('recetas', where: 'id = ?', whereArgs: [recetaId]);
-    if (fotoFila.isNotEmpty) await Fotos.borrar(fotoFila.first['foto'] as String?);
+    await Fotos.borrarVarias(archivos);
     cambios.value++;
     return ids;
   }
